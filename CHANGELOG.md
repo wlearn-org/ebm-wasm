@@ -8,6 +8,7 @@
 - Feature importances from learned shape functions
 - Interaction term detection and training
 - Save/load via WLRN bundle format (JSON model blob)
-- Python wrapper (pure numpy inference, no native dependency)
+- Python wrapper: pure numpy inference (no native dependency for predict/save/load)
+- Python fit() via interpret package (optional dependency)
 - Cross-language golden fixture tests (JS trains, Python loads, predictions match)
-- 27 JS tests, cross-language compat tests in wlearn core repo
+- 27 JS tests, 22 Python fit tests, cross-language compat tests in wlearn core repo

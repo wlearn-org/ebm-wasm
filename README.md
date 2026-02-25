@@ -148,6 +148,17 @@ preds = model.predict(X)
 model.save()  # produces identical bundle
 ```
 
+The Python wrapper also supports training via the `interpret` package:
+
+```python
+from wlearn.ebm import EBMModel
+
+model = EBMModel.create({'seed': 42, 'maxRounds': 5000})
+model.fit(X_train, y_train)  # requires: pip install interpret
+preds = model.predict(X_test)
+bundle = model.save()  # WLRN bundle loadable from JS
+```
+
 ## Resource management
 
 WASM heap memory is not garbage collected. Call `.dispose()` on every model when done. A `FinalizationRegistry` safety net warns if you forget, but do not rely on it.

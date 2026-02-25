@@ -3,8 +3,11 @@
 ## 0.1.0 (unreleased)
 
 - Initial release
-- EBM classifier and regressor via InterpretML libebm compiled to WASM
+- EBM classifier and regressor via InterpretML libebm v0.7.5 compiled to WASM
 - Per-feature shape functions and local explanations (explainability)
 - Feature importances from learned shape functions
-- Save/load via WLRN bundle format (JSON model blob)
 - Interaction term detection and training
+- Save/load via WLRN bundle format (JSON model blob)
+- Python wrapper (pure numpy inference, no native dependency)
+- Cross-language golden fixture tests (JS trains, Python loads, predictions match)
+- 27 JS tests, cross-language compat tests in wlearn core repo

@@ -5,6 +5,7 @@ wasm/
 *.md
 !README.md
 !CHANGELOG.md
+!UPSTREAM.md
 *.log
 .DS_Store
 coverage/

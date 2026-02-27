@@ -24,10 +24,19 @@
     "verify": "bash scripts/verify-exports.sh"
   },
   "dependencies": {
-    "@wlearn/types": "^0.1.0",
-    "@wlearn/core": "^0.1.0"
+    "@wlearn/types": "0.1.0",
+    "@wlearn/core": "0.1.0"
   },
-  "keywords": ["ebm", "explainable-boosting-machine", "interpretable-ml", "gam", "machine-learning", "wasm", "webassembly", "wlearn"],
+  "keywords": [
+    "ebm",
+    "explainable-boosting-machine",
+    "interpretable-ml",
+    "gam",
+    "machine-learning",
+    "wasm",
+    "webassembly",
+    "wlearn"
+  ],
   "author": "Anton Zemlyansky",
   "license": "MIT"
 }

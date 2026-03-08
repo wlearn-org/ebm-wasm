@@ -145,7 +145,7 @@ em++ \
   -fno-math-errno -fno-trapping-math -ffp-contract=off \
   -Wno-c++11-narrowing \
   $INCLUDES \
-  -o "${OUTPUT_DIR}/ebm.cjs" \
+  -o "${OUTPUT_DIR}/ebm.js" \
   -s MODULARIZE=1 \
   -s SINGLE_FILE=1 \
   -s EXPORT_NAME=createEBM \
@@ -173,5 +173,5 @@ EOF
 rm -rf "$BUILD_TMP"
 
 echo "=== Build complete ==="
-ls -lh "${OUTPUT_DIR}/ebm.cjs"
+ls -lh "${OUTPUT_DIR}/ebm.js"
 cat "${OUTPUT_DIR}/BUILD_INFO"

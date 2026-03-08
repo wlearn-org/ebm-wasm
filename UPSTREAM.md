@@ -27,7 +27,7 @@
 
 ## Build output
 
-- `wasm/ebm.cjs` -- ~728KB (WASM embedded via SINGLE_FILE=1)
+- `wasm/ebm.js` -- ~728KB (WASM embedded via SINGLE_FILE=1)
 - Flags: `-O2 -std=c++14 -fexceptions -DNDEBUG`
 - Zones: cpu_64 (scalar double) only
 

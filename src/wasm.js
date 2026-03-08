@@ -9,7 +9,7 @@ async function loadEBM(options = {}) {
 
   loading = (async () => {
     // SINGLE_FILE=1: .wasm is embedded in the .js file, no locateFile needed
-    const createEBM = require('../wasm/ebm.cjs')
+    const createEBM = require('../wasm/ebm.js')
     wasmModule = await createEBM(options)
     return wasmModule
   })()

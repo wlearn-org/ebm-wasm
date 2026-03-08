@@ -1,9 +1,3 @@
-import { fileURLToPath } from 'url'
-import { dirname, join } from 'path'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
-
 let passed = 0
 let failed = 0
 
@@ -75,12 +69,14 @@ function makeRegressionData(n) {
   return { X, y }
 }
 
+async function main() {
+
 // ============================================================
 // WASM loading
 // ============================================================
 console.log('\n=== WASM Loading ===')
 
-const { loadEBM } = await import('../src/wasm.js')
+const { loadEBM, getWasm } = require('../src/wasm.js')
 const wasm = await loadEBM()
 
 await test('WASM module loads', async () => {
@@ -98,7 +94,7 @@ await test('get_last_error returns string', async () => {
 // ============================================================
 console.log('\n=== EBMModel ===')
 
-const { EBMModel } = await import('../src/model.js')
+const { EBMModel } = require('../src/model.js')
 
 await test('create() returns model', async () => {
   const model = await EBMModel.create()
@@ -269,24 +265,26 @@ await test('explain returns per-term contributions', async () => {
   assert(expl.termNames.length === expl.nTerms, 'termNames length should match nTerms')
 
   // Verify contributions sum to raw scores (approximately)
-  const wasm = (await import('../src/wasm.js')).getWasm()
-  const { data: xData, rows, cols } = { data: new Float64Array(X.flat()), rows: X.length, cols: X[0].length }
-  const xPtr = wasm._malloc(xData.length * 8)
-  wasm.HEAPF64.set(xData, xPtr / 8)
-  const scoresPtr = wasm._malloc(rows * 8)
-  wasm._wl_ebm_predict_scores(model._getHandle(), xPtr, rows, cols, scoresPtr)
+  const wasmRef = getWasm()
+  const xData = new Float64Array(X.flat())
+  const rows = X.length
+  const cols = X[0].length
+  const xPtr = wasmRef._malloc(xData.length * 8)
+  wasmRef.HEAPF64.set(xData, xPtr / 8)
+  const scoresPtr = wasmRef._malloc(rows * 8)
+  wasmRef._wl_ebm_predict_scores(model._getHandle(), xPtr, rows, cols, scoresPtr)
 
   for (let r = 0; r < rows; r++) {
     let contribSum = expl.intercept[0]
     for (let t = 0; t < expl.nTerms; t++) {
       contribSum += expl.contributions[r * expl.nTerms + t]
     }
-    const rawScore = wasm.HEAPF64[scoresPtr / 8 + r]
+    const rawScore = wasmRef.HEAPF64[scoresPtr / 8 + r]
     assertClose(contribSum, rawScore, 1e-6, `row ${r}: contrib sum ${contribSum} != score ${rawScore}`)
   }
 
-  wasm._free(xPtr)
-  wasm._free(scoresPtr)
+  wasmRef._free(xPtr)
+  wasmRef._free(scoresPtr)
   model.dispose()
 })
 
@@ -383,7 +381,7 @@ await test('NaN in features does not crash', async () => {
 // ============================================================
 console.log('\n=== Save / Load ===')
 
-const { decodeBundle, load: coreLoad } = await import('@wlearn/core')
+const { decodeBundle, load: coreLoad } = require('@wlearn/core')
 
 await test('save produces WLRN bundle', async () => {
   const model = await EBMModel.create({
@@ -660,3 +658,7 @@ await test('capabilities reflect task type', async () => {
 // ============================================================
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`)
 process.exit(failed > 0 ? 1 : 0)
+
+} // end main
+
+main()

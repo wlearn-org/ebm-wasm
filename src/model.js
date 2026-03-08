@@ -1,10 +1,10 @@
-import { loadEBM, getWasm } from './wasm.js'
-import {
+const { loadEBM, getWasm } = require('./wasm.js')
+const {
   normalizeY,
   encodeBundle, decodeBundle,
   register,
   DisposedError, NotFittedError
-} from '@wlearn/core'
+} = require('@wlearn/core')
 
 // FinalizationRegistry safety net -- warns if dispose() was never called
 const leakRegistry = typeof FinalizationRegistry !== 'undefined'
@@ -38,7 +38,7 @@ function withCString(wasm, str, fn) {
 
 // --- EBMModel ---
 
-export class EBMModel {
+class EBMModel {
   #handle = null      // WlEbmModel* for predict
   #freed = false
   #handleRef = null
@@ -873,3 +873,5 @@ export class EBMModel {
 
 register('wlearn.ebm.classifier@1', async (m, t, b) => EBMModel._fromBundle(m, t, b))
 register('wlearn.ebm.regressor@1', async (m, t, b) => EBMModel._fromBundle(m, t, b))
+
+module.exports = { EBMModel }

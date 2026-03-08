@@ -4,7 +4,7 @@ InterpretML's Explainable Boosting Machine (EBM) compiled to WebAssembly. Interp
 
 EBM is a Generalized Additive Model (GAM) trained via cyclic gradient boosting, one feature at a time. It produces per-feature shape functions that are inherently interpretable while achieving accuracy competitive with black-box models.
 
-Based on [InterpretML v0.7.5](https://github.com/interpretml/interpret) (MIT license). Zero dependencies. ESM.
+Based on [InterpretML v0.7.5](https://github.com/interpretml/interpret) (MIT license). Zero dependencies. CommonJS.
 
 ## Install
 
@@ -15,7 +15,7 @@ npm install @wlearn/ebm
 ## Quick start
 
 ```js
-import { EBMModel } from '@wlearn/ebm'
+const { EBMModel } = require('@wlearn/ebm')
 
 const model = await EBMModel.create({ maxRounds: 500, seed: 42 })
 

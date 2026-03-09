@@ -47,5 +47,9 @@
   "devDependencies": {
     "esbuild": "^0.27.3",
     "playwright": "^1.58.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wlearn-org/ebm-wasm.git"
   }
 }

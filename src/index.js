@@ -1,10 +1,13 @@
 const { loadEBM, getWasm } = require('./wasm.js')
-const { EBMModel } = require('./model.js')
+const { EBMModel: EBMModelImpl } = require('./model.js')
+const { createModelClass } = require('@wlearn/core')
+
+const EBMModel = createModelClass(EBMModelImpl, EBMModelImpl, { name: 'EBMModel', load: loadEBM })
 
 // Convenience: create, fit, return fitted model
 async function train(params, X, y) {
   const model = await EBMModel.create(params)
-  model.fit(X, y)
+  await model.fit(X, y)
   return model
 }
 

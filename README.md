@@ -17,7 +17,11 @@ npm install @wlearn/ebm
 ```js
 const { EBMModel } = require('@wlearn/ebm')
 
-const model = await EBMModel.create({ maxRounds: 500, seed: 42 })
+const model = await EBMModel.create({
+  task: 'classification',  // or 'regression'; auto-detected from labels if omitted
+  maxRounds: 500,
+  seed: 42
+})
 
 // Train -- accepts number[][] or { data: Float64Array, rows, cols }
 model.fit(

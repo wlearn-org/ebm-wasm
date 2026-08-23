@@ -4,7 +4,7 @@ InterpretML's Explainable Boosting Machine (EBM) compiled to WebAssembly. Interp
 
 EBM is a Generalized Additive Model (GAM) trained via cyclic gradient boosting, one feature at a time. It produces per-feature shape functions that are inherently interpretable while achieving accuracy competitive with black-box models.
 
-Part of [wlearn](https://wlearn.org) ([GitHub](https://github.com/wlearn-org), [all packages](https://github.com/wlearn-org/wlearn#repository-structure)). Based on [InterpretML v0.7.5](https://github.com/interpretml/interpret) (MIT license). Zero dependencies. CommonJS.
+Part of [wlearn](https://wlearn.org) ([GitHub](https://github.com/wlearn-org), [all packages](https://github.com/wlearn-org/wlearn#repository-structure)). Based on [InterpretML v0.7.5](https://github.com/interpretml/interpret) (MIT license). Depends on `@wlearn/core`. CommonJS.
 
 ## Install
 
@@ -15,6 +15,7 @@ npm install @wlearn/ebm
 ## Quick start
 
 ```js
+const { readFileSync, writeFileSync } = require('fs')
 const { EBMModel } = require('@wlearn/ebm')
 
 const model = await EBMModel.create({
@@ -30,32 +31,28 @@ model.fit(
 )
 
 // Predict
-const preds = model.predict([[2, 3], [6, 7]])        // Float64Array
+const preds = model.predict([[2, 3], [6, 7]])        // Int32Array class labels
 const probs = model.predictProba([[2, 3], [6, 7]])    // Float64Array (nrow * nclass)
 const accuracy = model.score([[2, 3], [6, 7]], [0, 1])
 
 // Explain
 const explanations = model.explain([[2, 3]])
 // { intercept, contributions, termNames, nTerms, nSamples, nScores }
-// prediction = intercept + sum(contributions)
+// raw score/logit = intercept + sum(contributions for that score)
 
 const importances = model.featureImportances()  // Float64Array per term
 const shape = model.getShapeFunction(0)         // { x, y } for plotting
 
 // Save / load
-const buf = model.save()  // Uint8Array (WLRN bundle)
-const model2 = await EBMModel.load(buf)
-
-// Clean up -- required, WASM memory is not garbage collected
-model.dispose()
-model2.dispose()
+writeFileSync('ebm.wlrn', model.save())
+const model2 = await EBMModel.load(readFileSync('ebm.wlrn'))
 ```
 
 ## Explainability
 
 EBM's primary advantage over black-box models is built-in interpretability.
 
-**Local explanations** (`explain(X)`) return per-sample, per-term additive contributions. For each sample, the prediction equals `intercept + sum(contributions)`. This tells you exactly how much each feature contributed to every prediction.
+**Local explanations** (`explain(X)`) return per-sample, per-term additive contributions. For each sample and score, the raw score equals `intercept + sum(contributions)`. Regression returns that raw score directly; classifiers convert raw scores to probabilities and labels.
 
 **Global importances** (`featureImportances()`) return mean absolute scores across bins for each term, showing which features matter most overall.
 
@@ -71,17 +68,23 @@ Async factory. Loads WASM module on first call, returns a ready-to-use model.
 
 Train the model. Returns `this`.
 - `X` -- `number[][]` or `{ data: Float64Array, rows, cols }`
-- `y` -- `number[]` or `Float64Array`
+- classifier `y` -- two or more arbitrary int32-valued classes
+- regressor `y` -- finite numeric targets
 
-Task is auto-detected: integer labels become classification, non-integer becomes regression. Override with `objective: 'regression'` param.
+Set `task: 'classification'` or `task: 'regression'` explicitly when the intent is
+known. If omitted, integer labels are treated as classification and labels with a
+non-integer value as regression. An explicit backend `objective` takes precedence.
 
-### `model.predict(X)` -> `Float64Array`
+### `model.predict(X)` -> `Int32Array | Float64Array`
 
-Predict class labels (classification) or values (regression).
+Returns public class labels as `Int32Array` for classification and numeric values
+as `Float64Array` for regression.
 
 ### `model.predictProba(X)` -> `Float64Array`
 
-Predict class probabilities. Returns flat array of shape `nSamples * nClasses` (row-major). Binary: `[P(0), P(1)]` per sample. Classification only.
+Predict class probabilities. Returns a flat array of shape
+`nSamples * nClasses` (row-major); columns follow the sorted order in
+`model.classes`. Classification only.
 
 ### `model.score(X, y)` -> `number`
 
@@ -91,7 +94,11 @@ Accuracy (classification) or R-squared (regression).
 
 Local explanations: per-sample, per-term additive contributions.
 
-Returns `{ intercept, contributions, termNames, nTerms, nSamples, nScores }`. The `contributions` array is flat: `nSamples * nTerms * nScores`. For each sample: `prediction = intercept + sum(contributions[sample])`.
+Returns `{ intercept, contributions, termNames, nTerms, nSamples, nScores }`. The
+`contributions` array is flat: `nSamples * nTerms * nScores`. For each sample and
+score, `rawScore = intercept + sum(contributions)`. Regression predictions equal
+the raw score. Binary classification applies the logistic function; multiclass
+classification applies softmax before choosing a label.
 
 ### `model.featureImportances()` -> `Float64Array`
 
@@ -110,7 +117,7 @@ Save to / load from `Uint8Array` (WLRN bundle with JSON model blob).
 
 ### `model.dispose()`
 
-Free WASM memory. Required. Idempotent.
+Release WASM memory immediately. Use in long-running apps, workers, cross-validation, and AutoML loops. Idempotent.
 
 ### `model.getParams()` / `model.setParams(p)`
 
@@ -133,21 +140,33 @@ Returns default hyperparameter search space for AutoML.
 | `maxInteractions` | 10 | Number of interaction terms (0 = no interactions) |
 | `maxBins` | 256 | Maximum bins per feature |
 | `minSamplesBin` | 1 | Minimum samples per bin |
-| `outerBags` | 8 | Number of outer bags |
 | `innerBags` | 0 | Number of inner bags |
 | `regAlpha` | 0 | L1 regularization |
 | `regLambda` | 0 | L2 regularization |
 | `seed` | 42 | Random seed |
 
+The current wrapper trains one booster. Interpret-style outer bagging is not yet
+implemented, so an explicit `outerBags` parameter is rejected instead of being
+silently ignored.
+
+## Classifier migration from 0.2
+
+Version 0.3 returns classifier labels as `Int32Array`, matching the wlearn
+classifier contract. Version 0.2 returned the same label values in a
+`Float64Array`. Regression predictions remain `Float64Array`.
+
 ## Cross-runtime compatibility
 
-Models saved in JS load and predict identically in the Python `wlearn` package. WLRN bundles round-trip between JS and Python (blob bytes are preserved). The Python wrapper uses pure numpy for prediction (no native InterpretML dependency needed at inference time).
+Models saved in JS load and predict within the declared cross-runtime tolerance in
+the Python `wlearn` package. WLRN bundles round-trip between JS and Python (blob
+bytes are preserved). The Python wrapper uses pure numpy for prediction (no native
+InterpretML dependency needed at inference time).
 
 ```python
 import wlearn.ebm
 from wlearn import load
 
-model = load(open('model.wlrn', 'rb').read())
+model = load('model.wlrn')
 preds = model.predict(X)
 model.save()  # produces identical bundle
 ```
@@ -160,12 +179,12 @@ from wlearn.ebm import EBMModel
 model = EBMModel.create({'seed': 42, 'maxRounds': 5000})
 model.fit(X_train, y_train)  # requires: pip install interpret
 preds = model.predict(X_test)
-bundle = model.save()  # WLRN bundle loadable from JS
+model.save('ebm.wlrn')  # WLRN bundle loadable from JS
 ```
 
 ## Resource management
 
-WASM heap memory is not garbage collected. Call `.dispose()` on every model when done. A `FinalizationRegistry` safety net warns if you forget, but do not rely on it.
+Use `.dispose()` when creating and discarding many models so WASM memory is released promptly.
 
 ## Build from source
 

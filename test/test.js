@@ -89,6 +89,28 @@ await test('get_last_error returns string', async () => {
   assert(typeof err === 'string', `expected string, got ${typeof err}`)
 })
 
+await test('C model allocation rejects invalid dimensions', async () => {
+  const wasmRef = getWasm()
+  assert(wasmRef._wl_ebm_alloc_model(0, 0, 1, 1) === 0,
+    'zero-feature model allocation should fail')
+  assert(wasmRef._wl_ebm_alloc_model(0, 1, 0, 1) === 0,
+    'zero-term model allocation should fail')
+})
+
+await test('C allocating setters return failure status for invalid requests', async () => {
+  const wasmRef = getWasm()
+  const handle = wasmRef._wl_ebm_alloc_model(0, 1, 1, 1)
+  assert(handle !== 0, 'valid model allocation failed')
+  try {
+    assert(wasmRef._wl_ebm_set_feature(handle, 0, 0, -1) !== 0,
+      'invalid feature allocation returned success')
+    assert(wasmRef._wl_ebm_set_term(handle, 0, 1, 0) !== 0,
+      'invalid term allocation returned success')
+  } finally {
+    wasmRef._wl_ebm_free_model(handle)
+  }
+})
+
 // ============================================================
 // EBMModel basics
 // ============================================================
@@ -122,9 +144,10 @@ await test('Binary classification', async () => {
   assert(model.isFitted, 'should be fitted')
   assert(model.capabilities.classifier, 'should be classifier')
   assert(model.nrClass === 2, `expected 2 classes, got ${model.nrClass}`)
+  assert(model.nTerms === 2, `maxInteractions=0 should produce 2 univariate terms, got ${model.nTerms}`)
 
   const preds = model.predict(X)
-  assert(preds instanceof Float64Array, 'predictions should be Float64Array')
+  assert(preds instanceof Int32Array, 'classifier predictions should be Int32Array')
   assert(preds.length === 120, `expected 120 predictions, got ${preds.length}`)
 
   let correct = 0
@@ -161,6 +184,7 @@ await test('Multiclass classification', async () => {
   assert(model.capabilities.classifier, 'should be classifier')
 
   const preds = model.predict(X)
+  assert(preds instanceof Int32Array, 'multiclass predictions should be Int32Array')
   assert(preds.length === 180, `expected 180 predictions, got ${preds.length}`)
 
   // All predictions should be valid class labels
@@ -381,7 +405,7 @@ await test('NaN in features does not crash', async () => {
 // ============================================================
 console.log('\n=== Save / Load ===')
 
-const { decodeBundle, load: coreLoad } = require('@wlearn/core')
+const { decodeBundle, encodeBundle, load: coreLoad } = require('@wlearn/core')
 
 await test('save produces WLRN bundle', async () => {
   const model = await EBMModel.create({
@@ -462,6 +486,278 @@ await test('save and load round-trip', async () => {
   model2.dispose()
 })
 
+await test('classifier preserves arbitrary int32 labels across save/load', async () => {
+  const model = await EBMModel.create({
+    maxRounds: 120, learningRate: 0.05, maxInteractions: 0, seed: 42
+  })
+  const { X, y } = makeLinearData(80)
+  const publicY = y.map(value => value ? 7 : -3)
+  model.fit(X, publicY)
+  assert(Array.from(model.classes).join(',') === '-3,7', `classes=${Array.from(model.classes)}`)
+  for (const label of model.predict(X)) {
+    assert(label === -3 || label === 7, `unexpected label ${label}`)
+  }
+  const loaded = await EBMModel.load(model.save())
+  assert(Array.from(loaded.classes).join(',') === '-3,7', 'loaded class order differs')
+  assert(loaded.predict(X) instanceof Int32Array, 'loaded classifier dtype differs')
+  loaded.dispose()
+  model.dispose()
+})
+
+await test('classification validation is transactional and score validates length', async () => {
+  const model = await EBMModel.create({
+    task: 'classification', maxRounds: 80, maxInteractions: 0, seed: 42
+  })
+  const { X, y } = makeLinearData(40)
+  model.fit(X, y)
+  const before = model.predict(X)
+
+  const invalidLabels = [
+    y.slice(0, -1),
+    y.map((value, index) => index === 0 ? 0.5 : value),
+    y.map((value, index) => index === 0 ? 2147483648 : value),
+    new Array(y.length).fill(1)
+  ]
+  for (const invalid of invalidLabels) {
+    let rejected = false
+    try { model.fit(X, invalid) } catch { rejected = true }
+    assert(rejected, 'invalid classifier labels were accepted')
+    const after = model.predict(X)
+    for (let i = 0; i < before.length; i++) {
+      assert(before[i] === after[i], `invalid refit changed model at ${i}`)
+    }
+  }
+
+  let scoreRejected = false
+  try { model.score(X, y.slice(0, -1)) } catch (error) {
+    scoreRejected = /y length/.test(error.message)
+  }
+  assert(scoreRejected, 'score accepted mismatched y length')
+  model.dispose()
+})
+
+await test('outerBags is rejected instead of silently ignored', async () => {
+  const model = await EBMModel.create({ outerBags: 8 })
+  const { X, y } = makeLinearData(20)
+  let rejected = false
+  try { model.fit(X, y) } catch (error) { rejected = /not supported/.test(error.message) }
+  assert(rejected, 'outerBags remained a silent no-op')
+  model.dispose()
+})
+
+await test('direct load verifies hashes and task identity', async () => {
+  const model = await EBMModel.create({ maxRounds: 60, maxInteractions: 0, seed: 42 })
+  const { X, y } = makeLinearData(30)
+  model.fit(X, y)
+  const bytes = model.save()
+  model.dispose()
+
+  const tampered = new Uint8Array(bytes)
+  tampered[tampered.length - 1] ^= 1
+  let hashRejected = false
+  try { await EBMModel.load(tampered) } catch (error) {
+    hashRejected = /SHA-256 mismatch/.test(error.message)
+  }
+  assert(hashRejected, 'direct load skipped artifact hash validation')
+
+  const { manifest, toc, blobs } = decodeBundle(bytes)
+  const artifacts = toc.map(entry => ({
+    id: entry.id,
+    data: new Uint8Array(blobs.slice(entry.offset, entry.offset + entry.length)),
+    mediaType: entry.mediaType
+  }))
+  const wrongManifest = JSON.parse(JSON.stringify(manifest))
+  wrongManifest.typeId = 'wlearn.ebm.regressor@1'
+  wrongManifest.metadata.nClasses = 0
+  wrongManifest.metadata.classes = []
+  const wrongTask = encodeBundle(wrongManifest, artifacts)
+  let taskRejected = false
+  try { await EBMModel.load(wrongTask) } catch (error) {
+    taskRejected = /task\/format/.test(error.message)
+  }
+  assert(taskRejected, 'direct load accepted mismatched task identity')
+
+  for (const key of ['objective', 'task']) {
+    const wrongParams = JSON.parse(JSON.stringify(manifest))
+    wrongParams.params = { ...wrongParams.params, [key]: 'regression' }
+    let paramsRejected = false
+    try { await EBMModel.load(encodeBundle(wrongParams, artifacts)) } catch (error) {
+      paramsRejected = /does not match fitted classification task/.test(error.message)
+    }
+    assert(paramsRejected, `direct load accepted mismatched ${key}`)
+  }
+
+  const loaded = await EBMModel.load(bytes)
+  loaded.setParams({ objective: 'regression' })
+  let saveRejected = false
+  try { loaded.save() } catch (error) {
+    saveRejected = /does not match fitted classification task/.test(error.message)
+  }
+  assert(saveRejected, 'save emitted params that disagree with fitted task')
+  loaded.dispose()
+})
+
+await test('direct load rejects malformed model tables before C construction', async () => {
+  const model = await EBMModel.create({ maxRounds: 60, maxInteractions: 0, seed: 42 })
+  const { X, y } = makeLinearData(30)
+  model.fit(X, y)
+  const bytes = model.save()
+  model.dispose()
+
+  function mutateModel(mutator) {
+    const { manifest, toc, blobs } = decodeBundle(bytes)
+    const entry = toc.find(item => item.id === 'model')
+    const modelData = JSON.parse(new TextDecoder().decode(
+      blobs.subarray(entry.offset, entry.offset + entry.length)
+    ))
+    mutator(modelData)
+    return encodeBundle(manifest, [{
+      id: 'model',
+      mediaType: entry.mediaType,
+      data: new TextEncoder().encode(JSON.stringify(modelData))
+    }])
+  }
+
+  const cases = [
+    data => { data.terms[0].features[0] = data.nFeatures },
+    data => { data.terms[0].binCounts[0] = 0 },
+    data => { data.terms[0].binCounts[0]++ },
+    data => { data.terms[0].scores.pop() },
+    data => { data.features[0].cuts[1] = data.features[0].cuts[0] },
+    data => { data.intercept[0] = null },
+    data => { data.nScores = 2 }
+  ]
+  for (const mutate of cases) {
+    let rejected = false
+    try { await EBMModel.load(mutateModel(mutate)) } catch { rejected = true }
+    assert(rejected, 'malformed model table reached C construction')
+  }
+
+  const { manifest, toc, blobs } = decodeBundle(bytes)
+  const entry = toc.find(item => item.id === 'model')
+  const extraArtifact = encodeBundle(manifest, [
+    {
+      id: 'model', mediaType: entry.mediaType,
+      data: new Uint8Array(blobs.slice(entry.offset, entry.offset + entry.length))
+    },
+    { id: 'unexpected', data: new Uint8Array([1]) }
+  ])
+  let extraRejected = false
+  try { await EBMModel.load(extraArtifact) } catch { extraRejected = true }
+  assert(extraRejected, 'EBM load accepted an undeclared extra artifact')
+})
+
+await test('nominal model tables use integer bins and final-bin fallback', async () => {
+  const modelData = {
+    format: 'ebm-json-v1',
+    task: 'classification',
+    nFeatures: 1,
+    nTerms: 1,
+    nScores: 1,
+    intercept: [0],
+    features: [{ type: 'nominal', nBins: 3 }],
+    terms: [{ features: [0], binCounts: [3], scores: [-2, 2, 4] }]
+  }
+  const bundle = encodeBundle({
+    typeId: 'wlearn.ebm.classifier@1',
+    params: { objective: 'classification' },
+    metadata: {
+      nClasses: 2,
+      classes: [3, 7],
+      termNames: ['feature_0'],
+      featureNames: ['feature_0']
+    }
+  }, [{
+    id: 'model',
+    mediaType: 'application/octet-stream',
+    data: new TextEncoder().encode(JSON.stringify(modelData))
+  }])
+  const model = await EBMModel.load(bundle)
+  const X = [[0], [1], [2], [7], [NaN]]
+  const predictions = model.predict(X)
+  assert(JSON.stringify(Array.from(predictions)) === JSON.stringify([3, 7, 7, 7, 7]),
+    `unexpected nominal predictions: ${Array.from(predictions)}`)
+  const explanation = model.explain(X)
+  assert(JSON.stringify(Array.from(explanation.contributions)) === JSON.stringify([-2, 2, 4, 4, 4]),
+    `unexpected nominal contributions: ${Array.from(explanation.contributions)}`)
+  const shape = model.getShapeFunction(0)
+  assert(JSON.stringify(Array.from(shape.x)) === JSON.stringify([0, 1, 2]),
+    `unexpected nominal shape coordinates: ${Array.from(shape.x)}`)
+  assert(JSON.stringify(Array.from(shape.y)) === JSON.stringify([-2, 2, 4]),
+    `unexpected nominal shape scores: ${Array.from(shape.y)}`)
+  model.dispose()
+
+  modelData.terms[0].binCounts[0] = 2
+  modelData.terms[0].scores = [-2, 2]
+  const inconsistent = encodeBundle({
+    typeId: 'wlearn.ebm.classifier@1',
+    params: { objective: 'classification' },
+    metadata: {
+      nClasses: 2,
+      classes: [3, 7],
+      termNames: ['feature_0'],
+      featureNames: ['feature_0']
+    }
+  }, [{
+    id: 'model',
+    mediaType: 'application/octet-stream',
+    data: new TextEncoder().encode(JSON.stringify(modelData))
+  }])
+  let mismatchRejected = false
+  try { await EBMModel.load(inconsistent) } catch (error) {
+    mismatchRejected = /bin count disagrees/.test(error.message)
+  }
+  assert(mismatchRejected, 'nominal feature/term bin count mismatch was accepted')
+})
+
+await test('matrix shape validation rejects ragged and mismatched inputs transactionally', async () => {
+  const model = await EBMModel.create({ maxRounds: 60, maxInteractions: 0, seed: 42 })
+  const { X, y } = makeLinearData(30)
+
+  let raggedFitRejected = false
+  try { model.fit([[0, 1], [2]], [0, 1]) } catch (error) {
+    raggedFitRejected = /row 1 has length/.test(error.message)
+  }
+  assert(raggedFitRejected, 'ragged fit input was accepted')
+
+  let typedFitRejected = false
+  try {
+    model.fit({ data: new Float64Array(3), rows: 2, cols: 2 }, [0, 1])
+  } catch (error) {
+    typedFitRejected = /data.length/.test(error.message)
+  }
+  assert(typedFitRejected, 'typed fit shape mismatch was accepted')
+
+  model.fit(X, y)
+  const before = model.predict(X)
+  for (const invalid of [
+    [[0, 1], [2]],
+    { data: new Float64Array(3), rows: 2, cols: 2 }
+  ]) {
+    let rejected = false
+    try { model.predict(invalid) } catch { rejected = true }
+    assert(rejected, 'invalid prediction matrix was accepted')
+  }
+  const after = model.predict(X)
+  for (let i = 0; i < before.length; i++) {
+    assert(before[i] === after[i], `invalid matrix changed fitted model at ${i}`)
+  }
+  model.dispose()
+})
+
+await test('unknown objective is rejected before fitting', async () => {
+  const model = await EBMModel.create({ objective: 'clustering' })
+  let rejected = false
+  try {
+    model.fit([[0], [1]], [0, 1])
+  } catch (error) {
+    rejected = /objective/.test(error.message)
+  }
+  assert(rejected, 'unknown objective was accepted')
+  assert(!model.isFitted, 'unknown objective changed model state')
+  model.dispose()
+})
+
 // ============================================================
 // Registry dispatch
 // ============================================================
@@ -518,6 +814,7 @@ await test('defaultSearchSpace returns object', async () => {
   assert(space.learningRate, 'missing learningRate in search space')
   assert(space.maxRounds, 'missing maxRounds in search space')
   assert(space.maxLeaves, 'missing maxLeaves in search space')
+  assert(space.outerBags === undefined, 'outerBags must not be advertised while unsupported')
 })
 
 // ============================================================

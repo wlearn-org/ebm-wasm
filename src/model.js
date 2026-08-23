@@ -1,7 +1,7 @@
 const { loadEBM, getWasm } = require('./wasm.js')
 const {
   normalizeY,
-  encodeBundle, decodeBundle,
+  encodeBundle, validateBundle,
   register,
   DisposedError, NotFittedError
 } = require('@wlearn/core')
@@ -18,6 +18,120 @@ const leakRegistry = typeof FinalizationRegistry !== 'undefined'
 
 // Internal sentinel for load path
 const LOAD_SENTINEL = Symbol('load')
+const MAX_C_INT = 2147483647
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function assertPositiveCInt(value, name) {
+  if (!Number.isInteger(value) || value < 1 || value > MAX_C_INT) {
+    throw new Error(`${name} must be a positive int32 value`)
+  }
+}
+
+function validateTaskParams(params, expectedTask) {
+  if (!isRecord(params)) throw new Error('EBM params must be an object')
+  for (const key of ['objective', 'task']) {
+    if (params[key] != null && params[key] !== expectedTask) {
+      throw new Error(`EBM ${key} ${JSON.stringify(params[key])} does not match fitted ${expectedTask} task`)
+    }
+  }
+  return params
+}
+
+function validateModelData(modelData, expectedTask, nClasses) {
+  if (!isRecord(modelData) || modelData.format !== 'ebm-json-v1' ||
+      modelData.task !== expectedTask) {
+    throw new Error(`EBM model task/format does not match ${expectedTask}`)
+  }
+
+  assertPositiveCInt(modelData.nFeatures, 'model nFeatures')
+  assertPositiveCInt(modelData.nTerms, 'model nTerms')
+  assertPositiveCInt(modelData.nScores, 'model nScores')
+
+  const expectedScores = expectedTask === 'regression'
+    ? 1
+    : (nClasses === 2 ? 1 : nClasses)
+  if (modelData.nScores !== expectedScores) {
+    throw new Error(`model nScores (${modelData.nScores}) does not match task/classes (${expectedScores})`)
+  }
+  if (!Array.isArray(modelData.intercept) ||
+      modelData.intercept.length !== modelData.nScores ||
+      !modelData.intercept.every(Number.isFinite)) {
+    throw new Error('model intercept must contain one finite value per score')
+  }
+  if (!Array.isArray(modelData.features) ||
+      modelData.features.length !== modelData.nFeatures) {
+    throw new Error('model features length does not match nFeatures')
+  }
+
+  for (let f = 0; f < modelData.features.length; f++) {
+    const feature = modelData.features[f]
+    if (!isRecord(feature) ||
+        (feature.type !== 'continuous' && feature.type !== 'nominal')) {
+      throw new Error(`model feature ${f} has an invalid type`)
+    }
+    if (feature.type === 'continuous') {
+      if (!Array.isArray(feature.cuts) || !feature.cuts.every(Number.isFinite) ||
+          feature.cuts.some((value, index) => index > 0 &&
+            value <= feature.cuts[index - 1])) {
+        throw new Error(`model feature ${f} cuts must be finite and strictly increasing`)
+      }
+      if (feature.cuts.length > MAX_C_INT - 2) {
+        throw new Error(`model feature ${f} has too many cuts`)
+      }
+    } else {
+      assertPositiveCInt(feature.nBins, `model feature ${f} nBins`)
+    }
+  }
+
+  if (!Array.isArray(modelData.terms) ||
+      modelData.terms.length !== modelData.nTerms) {
+    throw new Error('model terms length does not match nTerms')
+  }
+  for (let t = 0; t < modelData.terms.length; t++) {
+    const term = modelData.terms[t]
+    if (!isRecord(term) || !Array.isArray(term.features) ||
+        term.features.length < 1 || term.features.length > modelData.nFeatures ||
+        !Array.isArray(term.binCounts) ||
+        term.binCounts.length !== term.features.length) {
+      throw new Error(`model term ${t} has invalid dimensions`)
+    }
+    const seen = new Set()
+    let flatSize = 1
+    for (let d = 0; d < term.features.length; d++) {
+      const featureIndex = term.features[d]
+      const binCount = term.binCounts[d]
+      if (!Number.isInteger(featureIndex) || featureIndex < 0 ||
+          featureIndex >= modelData.nFeatures || seen.has(featureIndex)) {
+        throw new Error(`model term ${t} has an invalid feature index`)
+      }
+      seen.add(featureIndex)
+      assertPositiveCInt(binCount, `model term ${t} binCounts[${d}]`)
+      const feature = modelData.features[featureIndex]
+      if (feature.type === 'continuous' && binCount !== feature.cuts.length + 2) {
+        throw new Error(`model term ${t} bin count disagrees with feature ${featureIndex}`)
+      }
+      if (feature.type === 'nominal' && binCount !== feature.nBins) {
+        throw new Error(`model term ${t} bin count disagrees with feature ${featureIndex}`)
+      }
+      if (flatSize > Math.floor(MAX_C_INT / binCount)) {
+        throw new Error(`model term ${t} bin product exceeds int32 limits`)
+      }
+      flatSize *= binCount
+    }
+    if (flatSize > Math.floor(MAX_C_INT / modelData.nScores)) {
+      throw new Error(`model term ${t} score count exceeds int32 limits`)
+    }
+    const scoreCount = flatSize * modelData.nScores
+    if (!Array.isArray(term.scores) || term.scores.length !== scoreCount ||
+        !term.scores.every(Number.isFinite)) {
+      throw new Error(`model term ${t} must contain exactly ${scoreCount} finite scores`)
+    }
+  }
+  return modelData
+}
 
 // --- Helper: get last error from C ---
 function getLastError() {
@@ -92,15 +206,6 @@ class EBMModel {
   fit(X, y) {
     this.#ensureFitted(false)
 
-    // Dispose previous model if refitting
-    if (this.#handle) {
-      getWasm()._wl_ebm_free_model(this.#handle)
-      this.#handle = null
-      if (this.#handleRef) this.#handleRef[0] = null
-      if (leakRegistry) leakRegistry.unregister(this)
-    }
-    this.#modelData = null
-
     const wasm = getWasm()
     const { data: xData, rows, cols } = this.#normalizeX(X)
     const yNorm = normalizeY(y)
@@ -108,10 +213,24 @@ class EBMModel {
       throw new Error(`y length (${yNorm.length}) does not match X rows (${rows})`)
     }
 
-    // Determine task
-    const isRegressor = this.#params.objective === 'regression' || this.#detectRegression(yNorm)
-    this.#isRegressor = isRegressor
-
+    // An explicit backend objective wins. Otherwise the unified `task` contract
+    // overrides label heuristics, which is essential for integer-valued regression.
+    let isRegressor
+    if (this.#params.objective != null) {
+      if (this.#params.objective !== 'classification' &&
+          this.#params.objective !== 'regression') {
+        throw new Error("objective must be 'classification' or 'regression'")
+      }
+      isRegressor = this.#params.objective === 'regression'
+    } else if (this.#params.task === 'regression') {
+      isRegressor = true
+    } else if (this.#params.task === 'classification') {
+      isRegressor = false
+    } else if (this.#params.task != null) {
+      throw new Error(`Unknown task: '${this.#params.task}'. Use 'classification' or 'regression'.`)
+    } else {
+      isRegressor = this.#detectRegression(yNorm)
+    }
     let nClasses = 0
     let classes = null
     let yInt = null
@@ -120,40 +239,63 @@ class EBMModel {
       const unique = new Set()
       for (let i = 0; i < yNorm.length; i++) {
         const v = yNorm[i]
-        if (v !== Math.floor(v)) throw new Error(`Classifier labels must be integers, got ${v} at index ${i}`)
+        if (!Number.isInteger(v) || v < -2147483648 || v > 2147483647) {
+          throw new Error(`Classifier labels must be int32 values, got ${v} at index ${i}`)
+        }
         unique.add(v)
       }
       classes = [...unique].sort((a, b) => a - b)
       nClasses = classes.length
+      if (nClasses < 2) {
+        throw new Error(`Classification requires at least 2 classes, got ${nClasses}`)
+      }
       // Remap to 0-based contiguous
       const classMap = new Map()
       classes.forEach((c, i) => classMap.set(c, i))
       yInt = new Int32Array(rows)
       for (let i = 0; i < rows; i++) yInt[i] = classMap.get(yNorm[i])
-      this.#classes = new Int32Array(classes)
-      this.#nClasses = nClasses
     } else {
-      this.#classes = null
-      this.#nClasses = 0
+      for (let i = 0; i < yNorm.length; i++) {
+        if (!Number.isFinite(yNorm[i])) {
+          throw new Error(`Regression labels must be finite, got ${yNorm[i]} at index ${i}`)
+        }
+      }
     }
+
+    if (this.#params.outerBags !== undefined) {
+      throw new Error('outerBags is not supported by the current single-booster EBM wrapper')
+    }
+
+    // JS-side validation succeeded, so a refit may now release the old native
+    // model without making an invalid refit destructive.
+    if (this.#handle) {
+      wasm._wl_ebm_free_model(this.#handle)
+      this.#handle = null
+      if (this.#handleRef) this.#handleRef[0] = null
+      if (leakRegistry) leakRegistry.unregister(this)
+    }
+    this.#modelData = null
+    this.#fitted = false
+    this.#isRegressor = isRegressor
+    this.#classes = classes ? new Int32Array(classes) : null
+    this.#nClasses = nClasses
 
     // nScores: binary=1, multiclass=nClasses, regression=1
     const nScores = (!isRegressor && nClasses > 2) ? nClasses : 1
     this.#nScores = nScores
 
     // Parameters
-    const maxBins = this.#params.maxBins || 256
-    const minSamplesBin = this.#params.minSamplesBin || 1
-    const maxRounds = this.#params.maxRounds || 5000
-    const earlyStoppingRounds = this.#params.earlyStoppingRounds || 50
-    const learningRate = this.#params.learningRate || 0.01
-    const maxLeaves = this.#params.maxLeaves || 3
-    const minSamplesLeaf = this.#params.minSamplesLeaf || 2
-    const maxInteractions = this.#params.maxInteractions || 10
-    const outerBags = this.#params.outerBags || 8
-    const innerBags = this.#params.innerBags || 0
-    const regAlpha = this.#params.regAlpha || 0
-    const regLambda = this.#params.regLambda || 0
+    const maxBins = this.#params.maxBins ?? 256
+    const minSamplesBin = this.#params.minSamplesBin ?? 1
+    const maxRounds = this.#params.maxRounds ?? 5000
+    const earlyStoppingRounds = this.#params.earlyStoppingRounds ?? 50
+    const learningRate = this.#params.learningRate ?? 0.01
+    const maxLeaves = this.#params.maxLeaves ?? 3
+    const minSamplesLeaf = this.#params.minSamplesLeaf ?? 2
+    const maxInteractions = this.#params.maxInteractions ?? 10
+    const innerBags = this.#params.innerBags ?? 0
+    const regAlpha = this.#params.regAlpha ?? 0
+    const regLambda = this.#params.regLambda ?? 0
     const seed = this.#params.seed ?? 42
 
     // Step 1: Bin each feature
@@ -467,22 +609,29 @@ class EBMModel {
       throw new Error(`Predict failed: ${getLastError()}`)
     }
 
-    const result = new Float64Array(rows)
-    for (let i = 0; i < rows; i++) result[i] = wasm.HEAPF64[outPtr / 8 + i]
+    const raw = new Float64Array(rows)
+    for (let i = 0; i < rows; i++) raw[i] = wasm.HEAPF64[outPtr / 8 + i]
 
     // Remap back to original class labels if classification
     if (!this.#isRegressor && this.#classes) {
+      const result = new Int32Array(rows)
       for (let i = 0; i < rows; i++) {
-        const idx = Math.round(result[i])
-        if (idx >= 0 && idx < this.#classes.length) {
-          result[i] = this.#classes[idx]
+        const idx = Math.round(raw[i])
+        if (idx < 0 || idx >= this.#classes.length) {
+          wasm._free(xPtr)
+          wasm._free(outPtr)
+          throw new Error(`Predict returned invalid class index ${raw[i]} at row ${i}`)
         }
+        result[i] = this.#classes[idx]
       }
+      wasm._free(xPtr)
+      wasm._free(outPtr)
+      return result
     }
 
     wasm._free(xPtr)
     wasm._free(outPtr)
-    return result
+    return raw
   }
 
   predictProba(X) {
@@ -545,6 +694,9 @@ class EBMModel {
   score(X, y) {
     const preds = this.predict(X)
     const yArr = normalizeY(y)
+    if (yArr.length !== preds.length) {
+      throw new Error(`y length (${yArr.length}) does not match prediction rows (${preds.length})`)
+    }
 
     if (this.#isRegressor) {
       // R-squared
@@ -633,16 +785,21 @@ class EBMModel {
 
     if (term.features.length === 1) {
       const fi = term.features[0]
-      const cuts = md.features[fi].cuts
+      const feature = md.features[fi]
       // Bin centers: left edge of bin (for plotting)
       const nBins = term.binCounts[0]
       const x = new Float64Array(nBins)
-      // bin 0: below first cut, bin 1..nCuts: between cuts, bin nCuts+1: above last cut
-      // plus missing/unseen bins at the end
-      for (let i = 0; i < nBins; i++) {
-        if (i === 0 && cuts.length > 0) x[i] = cuts[0] - 1
-        else if (i <= cuts.length) x[i] = cuts[i - 1]
-        else x[i] = cuts[cuts.length - 1] + 1
+      if (feature.type === 'nominal') {
+        for (let i = 0; i < nBins; i++) x[i] = i
+      } else {
+        const cuts = feature.cuts
+        // bin 0: below first cut, bin 1..nCuts: between cuts,
+        // bin nCuts+1: above last cut (including missing/unseen fallback)
+        for (let i = 0; i < nBins; i++) {
+          if (i === 0 && cuts.length > 0) x[i] = cuts[0] - 1
+          else if (i <= cuts.length) x[i] = cuts[i - 1]
+          else x[i] = cuts[cuts.length - 1] + 1
+        }
       }
 
       if (ns === 1) {
@@ -669,6 +826,8 @@ class EBMModel {
 
   save() {
     this.#ensureFitted()
+    const expectedTask = this.#isRegressor ? 'regression' : 'classification'
+    const params = validateTaskParams(this.getParams(), expectedTask)
     const jsonStr = JSON.stringify(this.#modelData)
     const jsonBytes = new TextEncoder().encode(jsonStr)
     const typeId = this.#isRegressor
@@ -677,7 +836,7 @@ class EBMModel {
     return encodeBundle(
       {
         typeId,
-        params: this.getParams(),
+        params,
         metadata: {
           nClasses: this.#nClasses,
           classes: this.#classes ? Array.from(this.#classes) : [],
@@ -690,22 +849,56 @@ class EBMModel {
   }
 
   static async load(bytes) {
-    const { manifest, toc, blobs } = decodeBundle(bytes)
+    const { manifest, toc, blobs } = validateBundle(bytes)
     return EBMModel._fromBundle(manifest, toc, blobs)
   }
 
   static async _fromBundle(manifest, toc, blobs) {
     await loadEBM()
 
+    const classifier = manifest.typeId === 'wlearn.ebm.classifier@1'
+    const regressor = manifest.typeId === 'wlearn.ebm.regressor@1'
+    if (!classifier && !regressor) {
+      throw new Error(`EBMModel cannot load bundle type ${JSON.stringify(manifest.typeId)}`)
+    }
+
     const entry = toc.find(e => e.id === 'model')
     if (!entry) throw new Error('Bundle missing "model" artifact')
+    if (toc.length !== 1) throw new Error('EBM bundle must contain exactly one model artifact')
     const raw = blobs.subarray(entry.offset, entry.offset + entry.length)
-    const jsonStr = new TextDecoder().decode(raw)
+    const jsonStr = new TextDecoder('utf-8', { fatal: true }).decode(raw)
     const modelData = JSON.parse(jsonStr)
+    const expectedTask = classifier ? 'classification' : 'regression'
+    const params = validateTaskParams(manifest.params || {}, expectedTask)
 
     const meta = manifest.metadata || {}
+    if (classifier) {
+      const classes = meta.classes
+      if (!Number.isInteger(meta.nClasses) || meta.nClasses < 2 ||
+          !Array.isArray(classes) || classes.length !== meta.nClasses ||
+          !classes.every(value => Number.isInteger(value) &&
+            value >= -2147483648 && value <= 2147483647) ||
+          classes.some((value, index) => index > 0 && value <= classes[index - 1])) {
+        throw new Error(`${manifest.typeId} has invalid class metadata`)
+      }
+    } else if (meta.nClasses !== 0 ||
+               !(meta.classes == null ||
+                 (Array.isArray(meta.classes) && meta.classes.length === 0))) {
+      throw new Error(`${manifest.typeId} regressor has classifier metadata`)
+    }
+    validateModelData(modelData, expectedTask, classifier ? meta.nClasses : 0)
+    if (meta.termNames != null &&
+        (!Array.isArray(meta.termNames) || meta.termNames.length !== modelData.nTerms ||
+         !meta.termNames.every(value => typeof value === 'string'))) {
+      throw new Error(`${manifest.typeId} has invalid termNames metadata`)
+    }
+    if (meta.featureNames != null &&
+        (!Array.isArray(meta.featureNames) || meta.featureNames.length !== modelData.nFeatures ||
+         !meta.featureNames.every(value => typeof value === 'string'))) {
+      throw new Error(`${manifest.typeId} has invalid featureNames metadata`)
+    }
     return new EBMModel(LOAD_SENTINEL, modelData, {
-      params: manifest.params || {},
+      params,
       nClasses: meta.nClasses || 0,
       classes: meta.classes || null,
       termNames: meta.termNames || null,
@@ -747,7 +940,6 @@ class EBMModel {
       maxLeaves: { type: 'int_uniform', low: 2, high: 5 },
       maxInteractions: { type: 'int_uniform', low: 0, high: 20 },
       maxBins: { type: 'categorical', values: [128, 256, 512] },
-      outerBags: { type: 'int_uniform', low: 4, high: 16 },
       minSamplesLeaf: { type: 'int_uniform', low: 1, high: 10 }
     }
   }
@@ -788,20 +980,45 @@ class EBMModel {
 
   #normalizeX(X) {
     // Fast path: typed matrix { data, rows, cols }
-    if (X && typeof X === 'object' && !Array.isArray(X) && X.data) {
+    if (X && typeof X === 'object' && !Array.isArray(X) && X.data != null) {
       const { data, rows, cols } = X
-      if (data instanceof Float64Array) return { data, rows, cols }
-      return { data: new Float64Array(data), rows, cols }
+      if (!Number.isSafeInteger(rows) || rows < 1 ||
+          !Number.isSafeInteger(cols) || cols < 1 ||
+          rows > Math.floor(Number.MAX_SAFE_INTEGER / cols) ||
+          !Number.isSafeInteger(data.length) || data.length !== rows * cols) {
+        throw new Error('Typed X must have positive integer rows/cols and data.length === rows * cols')
+      }
+      let normalized
+      try {
+        normalized = data instanceof Float64Array ? data : new Float64Array(data)
+      } catch {
+        throw new Error('Typed X data must contain numeric values')
+      }
+      for (let i = 0; i < normalized.length; i++) {
+        if (!Number.isFinite(normalized[i]) && !Number.isNaN(normalized[i])) {
+          throw new Error(`X values must be finite or NaN, got ${normalized[i]} at flat index ${i}`)
+        }
+      }
+      return { data: normalized, rows, cols }
     }
 
     // Slow path: number[][]
     if (Array.isArray(X) && Array.isArray(X[0])) {
       const rows = X.length
       const cols = X[0].length
+      if (cols < 1) throw new Error('X rows must contain at least one feature')
       const data = new Float64Array(rows * cols)
       for (let i = 0; i < rows; i++) {
+        if (!Array.isArray(X[i]) || X[i].length !== cols) {
+          throw new Error(`X row ${i} has length ${X[i]?.length}; expected ${cols}`)
+        }
         for (let j = 0; j < cols; j++) {
-          data[i * cols + j] = X[i][j]
+          const value = X[i][j]
+          if (typeof value !== 'number' ||
+              (!Number.isFinite(value) && !Number.isNaN(value))) {
+            throw new Error(`X values must be finite numbers or NaN, got ${value} at row ${i}, column ${j}`)
+          }
+          data[i * cols + j] = value
         }
       }
       return { data, rows, cols }
@@ -833,36 +1050,45 @@ class EBMModel {
     const handle = wasm._wl_ebm_alloc_model(task, nf, nt, ns)
     if (!handle) throw new Error('Failed to allocate C model')
 
-    // Set intercept
-    for (let s = 0; s < ns; s++) {
-      wasm._wl_ebm_set_intercept(handle, s, modelData.intercept[s])
-    }
-
-    // Set features
-    for (let f = 0; f < nf; f++) {
-      const feat = modelData.features[f]
-      const type = feat.type === 'nominal' ? 1 : 0
-      const nCuts = feat.cuts ? feat.cuts.length : 0
-      wasm._wl_ebm_set_feature(handle, f, type, nCuts)
-      for (let c = 0; c < nCuts; c++) {
-        wasm._wl_ebm_set_feature_edge(handle, f, c, feat.cuts[c])
+    try {
+      // Set intercept
+      for (let s = 0; s < ns; s++) {
+        wasm._wl_ebm_set_intercept(handle, s, modelData.intercept[s])
       }
-    }
 
-    // Set terms
-    for (let t = 0; t < nt; t++) {
-      const term = modelData.terms[t]
-      const nDims = term.features.length
-      const flatSize = term.binCounts.reduce((a, b) => a * b, 1)
+      // Set features
+      for (let f = 0; f < nf; f++) {
+        const feat = modelData.features[f]
+        const type = feat.type === 'nominal' ? 1 : 0
+        const nCuts = feat.cuts ? feat.cuts.length : 0
+        if (wasm._wl_ebm_set_feature(handle, f, type, nCuts) !== 0) {
+          throw new Error(`Failed to allocate EBM feature ${f}: ${getLastError()}`)
+        }
+        for (let c = 0; c < nCuts; c++) {
+          wasm._wl_ebm_set_feature_edge(handle, f, c, feat.cuts[c])
+        }
+      }
 
-      wasm._wl_ebm_set_term(handle, t, nDims, flatSize)
-      for (let d = 0; d < nDims; d++) {
-        wasm._wl_ebm_set_term_feature(handle, t, d, term.features[d])
-        wasm._wl_ebm_set_term_bin_count(handle, t, d, term.binCounts[d])
+      // Set terms
+      for (let t = 0; t < nt; t++) {
+        const term = modelData.terms[t]
+        const nDims = term.features.length
+        const flatSize = term.binCounts.reduce((a, b) => a * b, 1)
+
+        if (wasm._wl_ebm_set_term(handle, t, nDims, flatSize) !== 0) {
+          throw new Error(`Failed to allocate EBM term ${t}: ${getLastError()}`)
+        }
+        for (let d = 0; d < nDims; d++) {
+          wasm._wl_ebm_set_term_feature(handle, t, d, term.features[d])
+          wasm._wl_ebm_set_term_bin_count(handle, t, d, term.binCounts[d])
+        }
+        for (let i = 0; i < flatSize * ns; i++) {
+          wasm._wl_ebm_set_term_score(handle, t, i, term.scores[i])
+        }
       }
-      for (let i = 0; i < flatSize * ns; i++) {
-        wasm._wl_ebm_set_term_score(handle, t, i, term.scores[i])
-      }
+    } catch (error) {
+      wasm._wl_ebm_free_model(handle)
+      throw error
     }
 
     return handle

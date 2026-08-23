@@ -16,6 +16,7 @@
 #include <string.h>
 #include <math.h>
 #include <float.h>
+#include <limits.h>
 
 #include "libebm.h"
 
@@ -79,6 +80,51 @@ static int find_bin(const double *edges, int n_cuts, double val) {
   return lo;
 }
 
+static int validate_model_ready(const WlEbmModel *model) {
+  if (!model || (model->task != 0 && model->task != 1) ||
+      model->n_features <= 0 || model->n_terms <= 0 || model->n_scores <= 0 ||
+      !model->intercept || !model->term_n_dims || !model->term_features ||
+      !model->term_bin_counts || !model->term_scores ||
+      !model->term_flat_sizes || !model->bin_edges || !model->n_cuts ||
+      !model->feature_types) {
+    set_error("incomplete EBM model");
+    return -1;
+  }
+  for (int fi = 0; fi < model->n_features; fi++) {
+    if ((model->feature_types[fi] != 0 && model->feature_types[fi] != 1) ||
+        model->n_cuts[fi] < 0 ||
+        (model->n_cuts[fi] > 0 && !model->bin_edges[fi])) {
+      set_error("incomplete EBM feature");
+      return -1;
+    }
+  }
+  for (int ti = 0; ti < model->n_terms; ti++) {
+    if (model->term_n_dims[ti] <= 0 || model->term_flat_sizes[ti] <= 0 ||
+        !model->term_features[ti] || !model->term_bin_counts[ti] ||
+        !model->term_scores[ti]) {
+      set_error("incomplete EBM term");
+      return -1;
+    }
+    int flat_size = 1;
+    for (int di = 0; di < model->term_n_dims[ti]; di++) {
+      int fi = model->term_features[ti][di];
+      int bin_count = model->term_bin_counts[ti][di];
+      if (fi < 0 || fi >= model->n_features || bin_count <= 0 ||
+          flat_size > INT_MAX / bin_count) {
+        set_error("invalid EBM term dimensions");
+        return -1;
+      }
+      flat_size *= bin_count;
+    }
+    if (flat_size != model->term_flat_sizes[ti] ||
+        flat_size > INT_MAX / model->n_scores) {
+      set_error("invalid EBM term size");
+      return -1;
+    }
+  }
+  return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Predict scores (raw, before link function)                          */
 /* ------------------------------------------------------------------ */
@@ -89,6 +135,7 @@ int wl_ebm_predict_scores(const WlEbmModel *model, const double *X,
     set_error("null argument to predict_scores");
     return -1;
   }
+  if (nrow <= 0 || ncol <= 0 || validate_model_ready(model) != 0) return -1;
   if (ncol != model->n_features) {
     set_error("feature count mismatch in predict_scores");
     return -1;
@@ -116,8 +163,15 @@ int wl_ebm_predict_scores(const WlEbmModel *model, const double *X,
         int bin;
         if (model->feature_types[fi] == 1) {
           /* Nominal: value IS the bin index */
-          int v = (int)row[fi];
-          bin = (v >= 0 && v < model->term_bin_counts[t][d]) ? v : model->term_bin_counts[t][d] - 1;
+          double value = row[fi];
+          if (!isfinite(value) || value < 0 || value > INT_MAX ||
+              floor(value) != value) {
+            bin = model->term_bin_counts[t][d] - 1;
+          } else {
+            int v = (int)value;
+            bin = v < model->term_bin_counts[t][d]
+              ? v : model->term_bin_counts[t][d] - 1;
+          }
         } else {
           bin = find_bin(model->bin_edges[fi], model->n_cuts[fi], row[fi]);
         }
@@ -147,10 +201,15 @@ int wl_ebm_predict_classes(const WlEbmModel *model, const double *X,
     set_error("null argument to predict_classes");
     return -1;
   }
+  if (nrow <= 0 || ncol <= 0 || validate_model_ready(model) != 0) return -1;
 
   int ns = model->n_scores;
 
   /* Allocate temp for raw scores */
+  if ((size_t)nrow > SIZE_MAX / (size_t)ns / sizeof(double)) {
+    set_error("score allocation exceeds addressable memory");
+    return -1;
+  }
   double *scores = (double *)malloc((size_t)nrow * ns * sizeof(double));
   if (!scores) {
     set_error("OOM in predict_classes");
@@ -201,6 +260,7 @@ int wl_ebm_explain_local(const WlEbmModel *model, const double *X,
     set_error("null argument to explain_local");
     return -1;
   }
+  if (nrow <= 0 || ncol <= 0 || validate_model_ready(model) != 0) return -1;
   if (ncol != model->n_features) {
     set_error("feature count mismatch in explain_local");
     return -1;
@@ -221,8 +281,15 @@ int wl_ebm_explain_local(const WlEbmModel *model, const double *X,
         int fi = model->term_features[t][d];
         int bin;
         if (model->feature_types[fi] == 1) {
-          int v = (int)row[fi];
-          bin = (v >= 0 && v < model->term_bin_counts[t][d]) ? v : model->term_bin_counts[t][d] - 1;
+          double value = row[fi];
+          if (!isfinite(value) || value < 0 || value > INT_MAX ||
+              floor(value) != value) {
+            bin = model->term_bin_counts[t][d] - 1;
+          } else {
+            int v = (int)value;
+            bin = v < model->term_bin_counts[t][d]
+              ? v : model->term_bin_counts[t][d] - 1;
+          }
         } else {
           bin = find_bin(model->bin_edges[fi], model->n_cuts[fi], row[fi]);
         }
@@ -248,7 +315,13 @@ int wl_ebm_explain_local(const WlEbmModel *model, const double *X,
 /* JS builds the model struct by calling set_model_* functions.        */
 /* ------------------------------------------------------------------ */
 
+void wl_ebm_free_model(WlEbmModel *m);
+
 WlEbmModel *wl_ebm_alloc_model(int task, int n_features, int n_terms, int n_scores) {
+  if ((task != 0 && task != 1) || n_features <= 0 || n_terms <= 0 || n_scores <= 0) {
+    set_error("invalid model dimensions");
+    return NULL;
+  }
   WlEbmModel *m = (WlEbmModel *)calloc(1, sizeof(WlEbmModel));
   if (!m) return NULL;
 
@@ -270,8 +343,9 @@ WlEbmModel *wl_ebm_alloc_model(int task, int n_features, int n_terms, int n_scor
   if (!m->intercept || !m->term_n_dims || !m->term_features ||
       !m->term_bin_counts || !m->term_scores || !m->term_flat_sizes ||
       !m->bin_edges || !m->n_cuts || !m->feature_types) {
-    /* Partial alloc cleanup handled by free_model */
-    return m;
+    wl_ebm_free_model(m);
+    set_error("OOM allocating model");
+    return NULL;
   }
   return m;
 }
@@ -282,13 +356,26 @@ void wl_ebm_set_intercept(WlEbmModel *m, int idx, double val) {
   }
 }
 
-void wl_ebm_set_feature(WlEbmModel *m, int fi, int type, int n_cuts_val) {
-  if (!m || fi < 0 || fi >= m->n_features) return;
+int wl_ebm_set_feature(WlEbmModel *m, int fi, int type, int n_cuts_val) {
+  if (!m || !m->feature_types || !m->n_cuts || !m->bin_edges ||
+      fi < 0 || fi >= m->n_features || (type != 0 && type != 1) ||
+      n_cuts_val < 0) {
+    set_error("invalid feature allocation request");
+    return -1;
+  }
+  double *edges = NULL;
+  if (n_cuts_val > 0) {
+    edges = (double *)calloc((size_t)n_cuts_val, sizeof(double));
+    if (!edges) {
+      set_error("OOM allocating feature cuts");
+      return -1;
+    }
+  }
+  free(m->bin_edges[fi]);
   m->feature_types[fi] = type;
   m->n_cuts[fi] = n_cuts_val;
-  if (n_cuts_val > 0) {
-    m->bin_edges[fi] = (double *)calloc(n_cuts_val, sizeof(double));
-  }
+  m->bin_edges[fi] = edges;
+  return 0;
 }
 
 void wl_ebm_set_feature_edge(WlEbmModel *m, int fi, int ci, double val) {
@@ -297,13 +384,32 @@ void wl_ebm_set_feature_edge(WlEbmModel *m, int fi, int ci, double val) {
   m->bin_edges[fi][ci] = val;
 }
 
-void wl_ebm_set_term(WlEbmModel *m, int ti, int n_dims, int flat_size) {
-  if (!m || ti < 0 || ti >= m->n_terms) return;
+int wl_ebm_set_term(WlEbmModel *m, int ti, int n_dims, int flat_size) {
+  if (!m || !m->term_n_dims || !m->term_flat_sizes || !m->term_features ||
+      !m->term_bin_counts || !m->term_scores || ti < 0 || ti >= m->n_terms ||
+      n_dims <= 0 || flat_size <= 0 || flat_size > INT_MAX / m->n_scores) {
+    set_error("invalid term allocation request");
+    return -1;
+  }
+  int *features = (int *)calloc((size_t)n_dims, sizeof(int));
+  int *bin_counts = (int *)calloc((size_t)n_dims, sizeof(int));
+  double *scores = (double *)calloc((size_t)flat_size * m->n_scores, sizeof(double));
+  if (!features || !bin_counts || !scores) {
+    free(features);
+    free(bin_counts);
+    free(scores);
+    set_error("OOM allocating term");
+    return -1;
+  }
+  free(m->term_features[ti]);
+  free(m->term_bin_counts[ti]);
+  free(m->term_scores[ti]);
   m->term_n_dims[ti] = n_dims;
   m->term_flat_sizes[ti] = flat_size;
-  m->term_features[ti] = (int *)calloc(n_dims, sizeof(int));
-  m->term_bin_counts[ti] = (int *)calloc(n_dims, sizeof(int));
-  m->term_scores[ti] = (double *)calloc((size_t)flat_size * m->n_scores, sizeof(double));
+  m->term_features[ti] = features;
+  m->term_bin_counts[ti] = bin_counts;
+  m->term_scores[ti] = scores;
+  return 0;
 }
 
 void wl_ebm_set_term_feature(WlEbmModel *m, int ti, int di, int feature_idx) {
@@ -320,7 +426,9 @@ void wl_ebm_set_term_bin_count(WlEbmModel *m, int ti, int di, int count) {
 
 void wl_ebm_set_term_score(WlEbmModel *m, int ti, int idx, double val) {
   if (!m || ti < 0 || ti >= m->n_terms) return;
-  if (!m->term_scores[ti] || idx < 0 || idx >= m->term_flat_sizes[ti] * m->n_scores) return;
+  if (!m->term_scores[ti] || idx < 0 ||
+      m->term_flat_sizes[ti] > INT_MAX / m->n_scores ||
+      idx >= m->term_flat_sizes[ti] * m->n_scores) return;
   m->term_scores[ti][idx] = val;
 }
 
@@ -331,16 +439,16 @@ void wl_ebm_free_model(WlEbmModel *m) {
   free(m->term_flat_sizes);
 
   for (int i = 0; i < m->n_terms; i++) {
-    free(m->term_features[i]);
-    free(m->term_bin_counts[i]);
-    free(m->term_scores[i]);
+    if (m->term_features) free(m->term_features[i]);
+    if (m->term_bin_counts) free(m->term_bin_counts[i]);
+    if (m->term_scores) free(m->term_scores[i]);
   }
   free(m->term_features);
   free(m->term_bin_counts);
   free(m->term_scores);
 
   for (int i = 0; i < m->n_features; i++) {
-    free(m->bin_edges[i]);
+    if (m->bin_edges) free(m->bin_edges[i]);
   }
   free(m->bin_edges);
   free(m->n_cuts);
